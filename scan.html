@@ -52,9 +52,13 @@
 
 <script>
 const $ = id => document.getElementById(id);
+const mem = {};
 const store = {
-  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+  get(k, d) {
+    if (k in mem) return mem[k];
+    try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; }
+  },
+  set(k, v) { mem[k] = v; try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
 };
 
 const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbz3bVbbcqYYrVDxdygyaxUuhf9AbqC7d6ZtYgQUPs_Juv5cPPqIupT6vRunWt-fBpFD/exec';
@@ -146,41 +150,58 @@ $('list').addEventListener('click', e => {
 });
 
 $('upload').addEventListener('click', async () => {
-  const url = store.get('url', ''), token = store.get('token', '');
-  if (!url || !token) { $('settings').style.display = 'block'; return; }
-  $('upload').disabled = true;
-  $('status').textContent = '上傳中…';
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ token, invoices: Object.values(pending) }),
-    });
-    const r = await res.json();
-    if (!r.ok) throw new Error(r.error || '上傳失敗');
-    r.added.forEach(a => delete pending[a.no]);
-    r.skipped.forEach(no => delete pending[no]);
-    save(); render();
-    let msg = `已寫入 ${r.added.length} 張`;
-    if (r.skipped.length) msg += `，重複略過 ${r.skipped.length} 張`;
-    if (r.errors.length) msg += `，失敗 ${r.errors.length} 張：${r.errors.map(e => e.no + ' ' + e.error).join('；')}`;
-    $('status').textContent = msg;
-  } catch (e) {
-    $('status').textContent = '上傳失敗：' + e.message + '（資料仍保留在清單）';
+  const url = store.get('url', '') || DEFAULT_URL, token = store.get('token', '');
+  if (!url || !token) {
+    $('settings').style.display = 'block';
+    $('url').value = url; $('token').value = token;
+    $('status').textContent = '缺少' + (!url ? '網址' : '') + (!url && !token ? '和' : '') + (!token ? 'Token' : '') + '，請填好按儲存';
+    return;
   }
+  $('upload').disabled = true;
+  const queue = Object.values(pending);
+  const BATCH = 15;
+  let added = 0, skipped = 0;
+  const errors = [];
+  for (let i = 0; i < queue.length; i += BATCH) {
+    const chunk = queue.slice(i, i + BATCH);
+    $('status').textContent = `上傳中… ${Math.min(i + BATCH, queue.length)} / ${queue.length}`;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ token, invoices: chunk }),
+      });
+      const text = await res.text();
+      let r;
+      try { r = JSON.parse(text); } catch (e) { throw new Error('伺服器回應異常：' + text.slice(0, 80)); }
+      if (!r.ok) throw new Error(r.error || '上傳失敗');
+      r.added.forEach(no => { delete pending[no]; added++; });
+      r.skipped.forEach(no => { delete pending[no]; skipped++; });
+      r.errors.forEach(e => errors.push(e.no + ' ' + e.error));
+      save(); render();
+    } catch (e) {
+      errors.push('第 ' + (i / BATCH + 1) + ' 批失敗：' + e.message);
+      if (/token/.test(e.message)) break;
+    }
+  }
+  let msg = `已寫入 ${added} 張`;
+  if (skipped) msg += `，重複略過 ${skipped} 張`;
+  if (errors.length) msg += `；未完成：${errors.join('；')}（未上傳的仍保留在清單，可再按上傳）`;
+  $('status').textContent = msg;
   $('upload').disabled = Object.keys(pending).length === 0;
 });
 
 $('gear').addEventListener('click', () => {
   const s = $('settings');
   s.style.display = s.style.display === 'block' ? 'none' : 'block';
-  $('url').value = store.get('url', '');
+  $('url').value = store.get('url', '') || DEFAULT_URL;
   $('token').value = store.get('token', '');
 });
 $('save').addEventListener('click', () => {
-  store.set('url', $('url').value.trim());
+  store.set('url', $('url').value.trim() || DEFAULT_URL);
   store.set('token', $('token').value.trim());
   $('settings').style.display = 'none';
+  $('status').textContent = '已儲存設定，可以按上傳了';
 });
 
 render();
