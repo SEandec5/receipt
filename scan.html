@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>發票掃描</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  :root { --bg:#f6f5f2; --card:#fff; --fg:#1d1d1b; --muted:#8a877f; --accent:#1f6f5c; --line:#e6e3dc; --warn:#b54a2c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151514; --card:#1f1f1d; --fg:#ecebe6; --muted:#8f8c84; --line:#2d2c29; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system, "PingFang TC", "Noto Sans TC", sans-serif; padding:16px 16px 120px; }
+  h1 { font-size:17px; margin:0 0 12px; display:flex; justify-content:space-between; align-items:center; }
+  h1 button { font-size:13px; }
+  #reader { width:100%; border-radius:12px; overflow:hidden; background:#000; }
+  .status { color:var(--muted); font-size:13px; margin:8px 0 16px; min-height:20px; }
+  .list { display:flex; flex-direction:column; gap:8px; }
+  .row { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; display:grid; grid-template-columns:1fr auto; gap:2px 8px; }
+  .row .no { font-weight:600; font-variant-numeric:tabular-nums; }
+  .row .amt { font-weight:600; text-align:right; font-variant-numeric:tabular-nums; }
+  .row .meta { color:var(--muted); font-size:13px; grid-column:1 / -1; }
+  .row button { background:none; border:none; color:var(--warn); font-size:13px; padding:0; justify-self:end; }
+  .bar { position:fixed; left:0; right:0; bottom:0; padding:12px 16px calc(12px + env(safe-area-inset-bottom)); background:var(--bg); border-top:1px solid var(--line); display:flex; gap:12px; align-items:center; }
+  .bar .sum { flex:1; font-size:14px; }
+  button.primary { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:12px 20px; font-size:16px; font-weight:600; }
+  button.primary:disabled { opacity:.4; }
+  button { font-family:inherit; }
+  .settings { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; display:none; }
+  .settings input { width:100%; padding:8px; margin:4px 0 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); font-size:14px; }
+  .flash { animation: f .4s; }
+  @keyframes f { from { background:#d9efe7; } }
+</style>
+</head>
+<body>
+<h1>發票掃描 <button id="gear">設定</button></h1>
+
+<div class="settings" id="settings">
+  <label>Apps Script 網址<input id="url" placeholder="https://script.google.com/macros/s/.../exec"></label>
+  <label>Token<input id="token"></label>
+  <button class="primary" id="save" style="padding:8px 16px;font-size:14px">儲存</button>
+</div>
+
+<div id="reader"></div>
+<div class="status" id="status">對準發票左邊的 QR code</div>
+<div class="list" id="list"></div>
+
+<div class="bar">
+  <div class="sum" id="sum">0 張</div>
+  <button class="primary" id="upload" disabled>上傳</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+};
+
+const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbz3bVbbcqYYrVDxdygyaxUuhf9AbqC7d6ZtYgQUPs_Juv5cPPqIupT6vRunWt-fBpFD/exec';
+if (!store.get('url', '')) store.set('url', DEFAULT_URL);
+
+// 網址 #u=...&t=... 可一次帶入設定
+(function () {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get('u')) store.set('url', h.get('u'));
+  if (h.get('t')) store.set('token', h.get('t'));
+  if (location.hash) history.replaceState(null, '', location.pathname);
+})();
+
+let pending = store.get('pending', {});   // no -> invoice
+let lastLeft = { no: null, at: 0 };
+const seen = new Map();                   // 防止同一條碼連續觸發
+
+// ---- 電子發票 QR 解析 ----
+function decodeItems(str, enc) {
+  if (enc === '2') {
+    try { str = new TextDecoder().decode(Uint8Array.from(atob(str), c => c.charCodeAt(0))); } catch (e) {}
+  }
+  const p = str.split(':');
+  const out = [];
+  for (let i = 0; i + 2 < p.length; i += 3) if (p[i] && p[i].trim()) out.push(p[i].trim());
+  return out;
+}
+
+function parseLeft(s) {
+  if (!/^[A-Z]{2}\d{8}\d{7}/.test(s) || s.length < 77) return null;
+  const parts = s.slice(78).split(':');       // [自用區, 本QR品目數, 總品目數, 編碼, 品項...]
+  const enc = parts[3] || '';
+  return {
+    no: s.slice(0, 2) + '-' + s.slice(2, 10),
+    rocYear: +s.slice(10, 13),
+    month: +s.slice(13, 15),
+    day: +s.slice(15, 17),
+    total: parseInt(s.slice(29, 37), 16),
+    buyer: s.slice(37, 45),
+    seller: s.slice(45, 53),
+    enc,
+    items: decodeItems(parts.slice(4).join(':'), enc),
+  };
+}
+
+function onScan(text) {
+  const now = Date.now();
+  if (seen.has(text) && now - seen.get(text) < 4000) return;
+  seen.set(text, now);
+
+  if (text.startsWith('**')) {                 // 右邊 QR：補品項
+    const inv = pending[lastLeft.no];
+    if (inv && now - lastLeft.at < 15000) {
+      decodeItems(text.slice(2), inv.enc).forEach(i => { if (!inv.items.includes(i)) inv.items.push(i); });
+      save(); render(inv.no);
+    }
+    return;
+  }
+
+  const inv = parseLeft(text);
+  if (!inv) { $('status').textContent = '這不是電子發票 QR code'; return; }
+  lastLeft = { no: inv.no, at: now };
+  if (pending[inv.no]) { $('status').textContent = inv.no + ' 已經掃過了'; return; }
+  pending[inv.no] = inv;
+  save(); render(inv.no);
+  if (navigator.vibrate) navigator.vibrate(60);
+  $('status').textContent = `✓ ${inv.no}　$${inv.total.toLocaleString()}　（可再掃右邊 QR 補品項）`;
+}
+
+function save() { store.set('pending', pending); }
+
+function render(flashNo) {
+  const list = Object.values(pending).sort((a, b) => (a.month - b.month) || (a.day - b.day));
+  $('list').innerHTML = list.map(inv => `
+    <div class="row${inv.no === flashNo ? ' flash' : ''}">
+      <div class="no">${inv.no}</div>
+      <div class="amt">$${inv.total.toLocaleString()}</div>
+      <div class="meta">${inv.rocYear}/${inv.month}/${inv.day}　統編 ${inv.seller}${inv.items.length ? '　' + inv.items.slice(0, 3).join('、') : ''}</div>
+      <button data-del="${inv.no}">移除</button>
+    </div>`).join('');
+  const total = list.reduce((s, i) => s + i.total, 0);
+  $('sum').textContent = `${list.length} 張　$${total.toLocaleString()}`;
+  $('upload').disabled = list.length === 0;
+}
+
+$('list').addEventListener('click', e => {
+  const no = e.target.dataset.del;
+  if (no) { delete pending[no]; save(); render(); }
+});
+
+$('upload').addEventListener('click', async () => {
+  const url = store.get('url', ''), token = store.get('token', '');
+  if (!url || !token) { $('settings').style.display = 'block'; return; }
+  $('upload').disabled = true;
+  $('status').textContent = '上傳中…';
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ token, invoices: Object.values(pending) }),
+    });
+    const r = await res.json();
+    if (!r.ok) throw new Error(r.error || '上傳失敗');
+    r.added.forEach(a => delete pending[a.no]);
+    r.skipped.forEach(no => delete pending[no]);
+    save(); render();
+    let msg = `已寫入 ${r.added.length} 張`;
+    if (r.skipped.length) msg += `，重複略過 ${r.skipped.length} 張`;
+    if (r.errors.length) msg += `，失敗 ${r.errors.length} 張：${r.errors.map(e => e.no + ' ' + e.error).join('；')}`;
+    $('status').textContent = msg;
+  } catch (e) {
+    $('status').textContent = '上傳失敗：' + e.message + '（資料仍保留在清單）';
+  }
+  $('upload').disabled = Object.keys(pending).length === 0;
+});
+
+$('gear').addEventListener('click', () => {
+  const s = $('settings');
+  s.style.display = s.style.display === 'block' ? 'none' : 'block';
+  $('url').value = store.get('url', '');
+  $('token').value = store.get('token', '');
+});
+$('save').addEventListener('click', () => {
+  store.set('url', $('url').value.trim());
+  store.set('token', $('token').value.trim());
+  $('settings').style.display = 'none';
+});
+
+render();
+const scanner = new Html5Qrcode('reader', { formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE] });
+scanner.start({ facingMode: 'environment' }, { fps: 12, qrbox: (w, h) => ({ width: Math.min(w, h) * 0.7, height: Math.min(w, h) * 0.7 }) }, onScan)
+  .catch(err => { $('status').textContent = '無法開啟相機：' + err; });
+</script>
+</body>
+</html>
